@@ -31,10 +31,27 @@ const LoadScripts = () => {
 
 /* --- HELPER FUNCTIONS --- */
 
+// Keep a missing or invalid close distinct from a genuine price.
+const normalizeClose = (raw) => {
+  if (raw == null || (typeof raw === 'string' && raw.trim() === '')) {
+    return { close: null, closeIssue: 'Missing close' };
+  }
+  const close = typeof raw === 'number' || typeof raw === 'string' ? Number(raw) : NaN;
+  if (!Number.isFinite(close) || close <= 0) {
+    return { close: null, closeIssue: 'Invalid close (expected a positive number)' };
+  }
+  return { close, closeIssue: null };
+};
+
+const displayClose = (close) => Number.isFinite(close) ? close.toFixed(2) : '—';
+
 // Parse CSV Text
 const parseCSV = (text) => {
   const lines = text.split('\n').filter(l => l.trim());
+  if (!lines.length) return [];
   const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+  // Respect an explicit Close column, even when that cell is blank.
+  const closeIndex = headers.includes('close') ? headers.indexOf('close') : headers.indexOf('price');
   
   return lines.slice(1).map((line, index) => {
     const values = line.split(',');
@@ -56,7 +73,7 @@ const parseCSV = (text) => {
       open: entry.open || entry.price || 0,
       high: entry.high || entry.open || 0,
       low: entry.low || entry.open || 0,
-      close: entry.close || entry.price || 0,
+      ...normalizeClose(closeIndex === -1 ? undefined : values[closeIndex]?.trim().replace(/^"(.*)"$/, '$1')),
       volume: entry.volume || 0,
       original: entry
     };
@@ -105,9 +122,8 @@ const generateSampleData = () => {
 
 // Stats Calculations
 const calculateStats = (data, key = 'close') => {
-  if (!data || !data.length) return { mean: 0, stdDev: 0, q1: 0, q3: 0, iqr: 0 };
-  
-  const values = data.map(d => d[key]).sort((a, b) => a - b);
+  const values = data.map(d => d[key]).filter(Number.isFinite).sort((a, b) => a - b);
+  if (!values.length) return null;
   const mean = values.reduce((sum, val) => sum + val, 0) / values.length;
   const variance = values.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / values.length;
   const stdDev = Math.sqrt(variance);
@@ -150,7 +166,7 @@ const FileUploader = ({ onDataLoaded }) => {
               open: entry.Open || entry.open || 0,
               high: entry.High || entry.high || 0,
               low: entry.Low || entry.low || 0,
-              close: entry.Close || entry.close || 0,
+              ...normalizeClose(entry.Close ?? entry.close),
               volume: entry.Volume || entry.volume || 0,
             }));
           } else {
@@ -249,21 +265,33 @@ const StockChart = ({ data, outliers }) => {
   if (!data || data.length === 0) return <div className="h-64 bg-gray-100 rounded flex items-center justify-center text-gray-400">No Data for Chart</div>;
 
   // Scales
-  const prices = data.map(d => d.close);
-  const minPrice = Math.min(...prices) * 0.95;
-  const maxPrice = Math.max(...prices) * 1.05;
+  let minPrice = Infinity;
+  let maxPrice = -Infinity;
+  for (const { close } of data) {
+    if (!Number.isFinite(close)) continue;
+    minPrice = Math.min(minPrice, close);
+    maxPrice = Math.max(maxPrice, close);
+  }
+  if (!Number.isFinite(minPrice)) {
+    return <div className="h-64 rounded flex items-center justify-center text-gray-400">No valid close prices to chart.</div>;
+  }
+  const lower = minPrice * 0.95;
+  const upper = maxPrice * 1.05;
   const padding = 40;
   // Ensure chartWidth and chartHeight are positive
   const chartWidth = Math.max(0, dimensions.width - padding * 2);
   const chartHeight = Math.max(0, dimensions.height - padding * 2);
 
-  const getX = (index) => padding + (index / (data.length - 1)) * chartWidth;
-  const getY = (price) => padding + chartHeight - ((price - minPrice) / (maxPrice - minPrice)) * chartHeight;
+  const getX = (index) => padding + (data.length === 1 ? 0.5 : index / (data.length - 1)) * chartWidth;
+  const getY = (price) => padding + chartHeight - ((price - lower) / (upper - lower)) * chartHeight;
 
-  // Generate Path
-  let pathD = `M ${getX(0)} ${getY(data[0].close)}`;
+  // Start a new line segment after a missing close; never draw through the gap.
+  let pathD = '';
+  let previousValid = false;
   data.forEach((d, i) => {
-    pathD += ` L ${getX(i)} ${getY(d.close)}`;
+    const valid = Number.isFinite(d.close);
+    if (valid) pathD += ` ${previousValid ? 'L' : 'M'} ${getX(i)} ${getY(d.close)}`;
+    previousValid = valid;
   });
 
   return (
@@ -288,7 +316,7 @@ const StockChart = ({ data, outliers }) => {
         {/* Outlier Points */}
         {data.map((d, i) => {
           const isOutlier = outliers[i] && outliers[i].length > 0;
-          if (isOutlier) {
+          if (isOutlier && Number.isFinite(d.close)) {
             return (
               <g key={d.id || i} className="group cursor-pointer">
                 <circle 
@@ -309,8 +337,8 @@ const StockChart = ({ data, outliers }) => {
       
       {/* Axis Labels */}
       <div className="absolute left-0 top-0 h-full flex flex-col justify-between py-10 text-xs text-gray-500 px-1 pointer-events-none">
-        <span>{maxPrice.toFixed(0)}</span>
-        <span>{minPrice.toFixed(0)}</span>
+        <span>{upper.toFixed(0)}</span>
+        <span>{lower.toFixed(0)}</span>
       </div>
       <div className="absolute bottom-0 left-0 w-full flex justify-between px-10 text-xs text-gray-500 pointer-events-none">
         <span>{data[0].date}</span>
@@ -352,8 +380,10 @@ export default function App() {
       const labels = [];
       const flags = [];
 
+      const validClose = Number.isFinite(entry.close);
+
       // 1. Z-Score Analysis
-      if (config.enableZScore) {
+      if (validClose && config.enableZScore && calculatedStats?.stdDev > 0) {
         const zScore = (entry.close - calculatedStats.mean) / calculatedStats.stdDev;
         if (Math.abs(zScore) > config.zScoreThreshold) {
           labels.push(`Z-Score (${zScore.toFixed(2)})`);
@@ -362,7 +392,7 @@ export default function App() {
       }
 
       // 2. IQR Analysis
-      if (config.enableIQR) {
+      if (validClose && config.enableIQR) {
         const lowerBound = calculatedStats.q1 - (config.iqrMultiplier * calculatedStats.iqr);
         const upperBound = calculatedStats.q3 + (config.iqrMultiplier * calculatedStats.iqr);
         if (entry.close < lowerBound || entry.close > upperBound) {
@@ -372,8 +402,8 @@ export default function App() {
       }
 
       // 3. Black Swan / Crash Detection (Day-over-Day change)
-      if (config.enableBlackSwan && index > 0) {
-        const prevClose = data[index - 1].close;
+      const prevClose = data[index - 1]?.close;
+      if (config.enableBlackSwan && validClose && Number.isFinite(prevClose) && prevClose > 0) {
         const change = (entry.close - prevClose) / prevClose;
         if (change < -config.blackSwanThreshold) {
           labels.push(`Black Swan Drop (${(change * 100).toFixed(1)}%)`);
@@ -413,18 +443,19 @@ export default function App() {
     if (!processedData.length) return;
     
     // Filter logic
-    const exportData = includeOutliers 
-      ? processedData 
-      : processedData.filter(d => !d.isOutlier);
+    const exportData = includeOutliers
+      ? processedData
+      : processedData.filter(d => !d.isOutlier && !d.closeIssue);
 
     // Convert to CSV
-    const headers = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Is_Outlier', 'Outlier_Reason'];
+    const headers = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Is_Outlier', 'Outlier_Reason', 'Validation_Issue'];
     const csvContent = [
       headers.join(','),
       ...exportData.map(d => [
         d.date, d.open, d.high, d.low, d.close, d.volume, 
         d.isOutlier ? 'TRUE' : 'FALSE',
-        d.isOutlier ? `"${d.outlierLabels.join('; ')}"` : ''
+        d.isOutlier ? `"${d.outlierLabels.join('; ')}"` : '',
+        d.closeIssue || ''
       ].join(','))
     ].join('\n');
 
@@ -432,7 +463,8 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.setAttribute('download', `Cleaned_${filename}`);
+    const baseName = filename.replace(/\.[^.]+$/, '');
+    link.setAttribute('download', `${includeOutliers ? 'Flagged' : 'Unflagged'}_${baseName}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -518,6 +550,10 @@ export default function App() {
                   <div className="p-3 bg-red-50 rounded-lg">
                     <p className="text-xs text-red-600 uppercase font-bold tracking-wider">Outliers Found</p>
                     <p className="text-2xl font-bold text-red-900">{Object.keys(outlierMap).length}</p>
+                  </div>
+                  <div className="col-span-2 p-3 bg-amber-50 rounded-lg">
+                    <p className="text-xs text-amber-700 uppercase font-bold tracking-wider">Close Price Validation Issues</p>
+                    <p className="text-2xl font-bold text-amber-900">{processedData.filter(row => row.closeIssue).length}</p>
                   </div>
                 </div>
                 {stats && (
@@ -623,18 +659,18 @@ export default function App() {
               {/* Actions */}
               <div className="space-y-3">
                 <button 
-                  onClick={() => downloadCleanedData(false)}
+                  onClick={() => downloadCleanedData(true)}
                   className="w-full flex items-center justify-center gap-2 bg-blue-600 text-white px-4 py-3 rounded-xl hover:bg-blue-700 transition font-medium shadow-sm"
                 >
                   <Download size={18} />
-                  Export Cleaned Dataset
+                  Export with Flags (All Rows)
                 </button>
                 <button 
-                  onClick={() => downloadCleanedData(true)}
+                  onClick={() => downloadCleanedData(false)}
                   className="w-full flex items-center justify-center gap-2 bg-white border border-gray-300 text-gray-700 px-4 py-3 rounded-xl hover:bg-gray-50 transition font-medium"
                 >
                   <FileText size={18} />
-                  Export with Flags
+                  Export Unflagged Rows Only
                 </button>
               </div>
 
@@ -675,19 +711,18 @@ export default function App() {
                     <StockChart data={processedData} outliers={outlierMap} />
                     
                     <div className="mt-8">
-                       <h4 className="font-semibold text-gray-800 mb-4">Detected Outliers Log</h4>
+                       <h4 className="font-semibold text-gray-800 mb-4">Price Review Log</h4>
                        <div className="max-h-64 overflow-y-auto pr-2 space-y-2 custom-scrollbar">
-                        {Object.entries(outlierMap).map(([index, reasons]) => {
-                          const item = processedData[parseInt(index)];
-                          if (!item) return null;
+                        {processedData.filter(row => row.isOutlier || row.closeIssue).map(item => {
+                          const reasons = item.closeIssue ? [item.closeIssue] : item.outlierLabels;
                           return (
-                            <div key={index} className="flex items-start gap-3 p-3 rounded-lg border border-red-100 bg-red-50">
+                            <div key={item.id} className="flex items-start gap-3 p-3 rounded-lg border border-red-100 bg-red-50">
                               <AlertTriangle className="text-red-500 shrink-0 mt-0.5" size={16} />
                               <div>
                                 <div className="flex items-center gap-2 mb-1">
                                   <span className="text-sm font-bold text-gray-900">{item.date}</span>
                                   <span className="text-xs bg-white px-2 py-0.5 rounded border border-red-200 text-red-700 font-mono">
-                                    {item.close.toFixed(2)}
+                                    {displayClose(item.close)}
                                   </span>
                                 </div>
                                 <div className="flex flex-wrap gap-2">
@@ -699,10 +734,10 @@ export default function App() {
                             </div>
                           );
                         })}
-                        {Object.keys(outlierMap).length === 0 && (
+                        {!processedData.some(row => row.isOutlier || row.closeIssue) && (
                           <div className="text-center py-8 text-gray-400">
                             <CheckCircle className="mx-auto mb-2 text-green-500" size={24} />
-                            <p>No outliers detected with current settings.</p>
+                            <p>No outliers or close price issues detected.</p>
                           </div>
                         )}
                        </div>
@@ -721,14 +756,18 @@ export default function App() {
                       </thead>
                       <tbody className="bg-white divide-y divide-gray-200">
                         {processedData.slice(0, 100).map((row, i) => (
-                          <tr key={i} className={row.isOutlier ? 'bg-red-50' : 'hover:bg-gray-50'}>
+                          <tr key={i} className={row.closeIssue ? 'bg-amber-50' : row.isOutlier ? 'bg-red-50' : 'hover:bg-gray-50'}>
                             <td className="px-3 py-2 whitespace-nowrap text-sm text-gray-900">{row.date}</td>
                             <td className="px-3 py-2 whitespace-nowrap text-sm text-gray-500">{row.open.toFixed(2)}</td>
                             <td className="px-3 py-2 whitespace-nowrap text-sm text-gray-500">{row.high.toFixed(2)}</td>
                             <td className="px-3 py-2 whitespace-nowrap text-sm text-gray-500">{row.low.toFixed(2)}</td>
-                            <td className="px-3 py-2 whitespace-nowrap text-sm text-gray-900 font-medium">{row.close.toFixed(2)}</td>
+                            <td className="px-3 py-2 whitespace-nowrap text-sm text-gray-900 font-medium">{displayClose(row.close)}</td>
                             <td className="px-3 py-2 whitespace-nowrap text-sm">
-                              {row.isOutlier ? (
+                              {row.closeIssue ? (
+                                <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-amber-100 text-amber-900">
+                                  {row.closeIssue}
+                                </span>
+                              ) : row.isOutlier ? (
                                 <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800">
                                   Outlier
                                 </span>
